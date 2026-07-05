@@ -14,7 +14,7 @@ Production-grade **15×15 Gomoku** AI with **Renju forbidden-move rules** for Bl
 ## Quick Start (Local)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gomoku-rl.git
+git clone https://github.com/ZhouNingyu327/gomoku-rl.git
 cd gomoku-rl
 pip install -e .
 
