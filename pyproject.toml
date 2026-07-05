@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gomoku-rl"
+version = "0.1.0"
+description = "AlphaZero-style Gomoku (Renju) reinforcement learning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gomoku-rl" }]
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+gui = []  # tkinter is stdlib on most platforms
+
+[project.scripts]
+gomoku-train = "gomoku_rl.main:main"
+gomoku-colab = "colab_train:main"
+gomoku-play = "play:main"
+
+[tool.setuptools.packages.find]
+include = ["gomoku_rl*"]
