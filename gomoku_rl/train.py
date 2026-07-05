@@ -40,9 +40,22 @@ from .env import BLACK, GomokuEnv, GameResult
 from .eval import EloEvaluator
 from .mcts import MCTS
 from .network import DualHeadNet, build_network
+from .policy_utils import sanitize_policy
 from . import symmetry as sym
 
 logger = logging.getLogger(__name__)
+
+
+def _actor_device_str(cfg: TrainConfig) -> str:
+    """Device for self-play actors (CPU recommended on single-GPU Colab)."""
+    if cfg.actor_device:
+        return cfg.actor_device
+    return cfg.device if torch.cuda.is_available() else "cpu"
+
+
+def _wait_for_actors_allowed(event: Optional[threading.Event]) -> None:
+    if event is not None:
+        event.wait()
 
 
 # ------------------------------------------------------------------ self-play
@@ -84,16 +97,14 @@ def _play_game(
             add_root_noise=(move_num == 0),
             temperature=temp,
         )
+        legal = env.legal_moves_mask()
+        action_probs = sanitize_policy(action_probs, legal)
         policies_list.append(action_probs)
 
-        if temp < cfg.temp_threshold:
+        if temp <= cfg.temp_threshold:
             action = int(np.argmax(action_probs))
         else:
-            legal = env.legal_moves_mask()
-            p = action_probs.copy()
-            p[~legal] = 0
-            p = p / (p.sum() + 1e-8)
-            action = int(rng.choice(len(p), p=p))
+            action = int(rng.choice(len(action_probs), p=action_probs))
 
         env.step(action)
         move_num += 1
@@ -123,6 +134,7 @@ def _actor_loop_shared_net(
     shared_net: DualHeadNet,
     net_lock: threading.Lock,
     device: torch.device,
+    actor_allowed: Optional[threading.Event] = None,
 ) -> None:
     """Colab actor: reuse one GPU network, sync weights via lock."""
     rng = np.random.default_rng(cfg.seed + actor_id)
@@ -130,6 +142,7 @@ def _actor_loop_shared_net(
     device_str = str(device)
 
     while not stop_event.is_set():
+        _wait_for_actors_allowed(actor_allowed)
         try:
             while True:
                 state = weight_queue.get_nowait()
@@ -142,6 +155,7 @@ def _actor_loop_shared_net(
         try:
             with net_lock:
                 shared_net.eval()
+            with torch.inference_mode():
                 traj = _play_game(cfg, {}, device_str, seed, net=shared_net)
             if traj is not None:
                 game_queue.put(traj)
@@ -159,17 +173,22 @@ def _actor_loop_thread(
     game_queue: queue.Queue,
     weight_queue: queue.Queue,
     stop_event: threading.Event,
+    actor_allowed: Optional[threading.Event] = None,
 ) -> None:
-    """Thread-based actor (lower memory than spawn on CPU-only machines)."""
-    device_str = cfg.device if torch.cuda.is_available() else "cpu"
+    """Thread-based actor; each thread reuses one local net on actor_device."""
+    device_str = _actor_device_str(cfg)
+    device = torch.device(device_str)
     rng = np.random.default_rng(cfg.seed + actor_id)
-    network_state = None
+    network_state: Optional[dict] = None
     game_count = 0
+    local_net = DualHeadNet(cfg).to(device)
 
     while not stop_event.is_set():
+        _wait_for_actors_allowed(actor_allowed)
         try:
             while True:
                 network_state = weight_queue.get_nowait()
+                local_net.load_state_dict(network_state)
         except queue.Empty:
             pass
 
@@ -179,7 +198,9 @@ def _actor_loop_thread(
 
         seed = int(rng.integers(0, 2**31 - 1))
         try:
-            traj = _play_game(cfg, network_state, device_str, seed)
+            with torch.inference_mode():
+                local_net.eval()
+                traj = _play_game(cfg, network_state, device_str, seed, net=local_net)
             if traj is not None:
                 game_queue.put(traj)
                 game_count += 1
@@ -247,7 +268,10 @@ class TrainPipeline:
     _optimizer: torch.optim.Optimizer = field(init=False)
     _scheduler: MultiStepLR = field(init=False)
     _step: int = field(init=False, default=0)
-    _stop_event: mp.Event = field(init=False)
+    _stop_event: threading.Event = field(init=False)
+    _inference_net: DualHeadNet = field(init=False)
+    _train_lock: threading.Lock = field(init=False)
+    _actor_allowed: threading.Event = field(init=False)
 
     def __post_init__(self) -> None:
         logging.basicConfig(
@@ -268,6 +292,9 @@ class TrainPipeline:
         self._net = build_network(self.cfg, self._device)
         self._baseline = build_network(self.cfg, self._device)
         self._baseline.load_state_dict(self._unwrap(self._net).state_dict())
+        self._inference_net = build_network(self.cfg, self._device)
+        self._inference_net.load_state_dict(self._unwrap(self._net).state_dict())
+        self._inference_net.eval()
         self._buffer = PrioritizedReplayBuffer(self.cfg)
         self._optimizer = AdamW(
             self._net.parameters(),
@@ -280,6 +307,9 @@ class TrainPipeline:
             gamma=self.cfg.lr_gamma,
         )
         self._stop_event = threading.Event()
+        self._train_lock = threading.Lock()
+        self._actor_allowed = threading.Event()
+        self._actor_allowed.set()
 
     # ------------------------------------------------------------------ public
     def run(self) -> None:
@@ -289,7 +319,9 @@ class TrainPipeline:
         thread_stop = threading.Event()
         net_lock = threading.Lock()
         shared_actor_net = (
-            self._unwrap(self._net) if self.cfg.shared_actor_net and use_threads else None
+            self._unwrap(self._inference_net)
+            if self.cfg.shared_actor_net and use_threads
+            else None
         )
 
         state = self._net_state_cpu()
@@ -310,10 +342,18 @@ class TrainPipeline:
                         shared_actor_net,
                         net_lock,
                         self._device,
+                        self._actor_allowed,
                     )
                 else:
                     target = _actor_loop_thread
-                    args = (i, self.cfg, game_queue, weight_queue, thread_stop)
+                    args = (
+                        i,
+                        self.cfg,
+                        game_queue,
+                        weight_queue,
+                        thread_stop,
+                        self._actor_allowed,
+                    )
                 t = threading.Thread(target=target, args=args, daemon=True)
                 t.start()
                 actors.append(t)
@@ -338,11 +378,12 @@ class TrainPipeline:
         collector.start()
 
         logger.info(
-            "Training on %s | actors=%d (%s%s) | buffer=%d | sims=%d",
+            "Training on %s | actors=%d (%s%s) on %s | buffer=%d | sims=%d",
             self._device,
             self.cfg.num_actors,
             "threads" if use_threads else "processes",
             ", shared-net" if shared_actor_net is not None else "",
+            _actor_device_str(self.cfg),
             self.cfg.buffer_capacity,
             self.cfg.num_simulations,
         )
@@ -358,7 +399,13 @@ class TrainPipeline:
                             pass
                     continue
 
-                loss = self._train_step()
+                self._actor_allowed.clear()
+                try:
+                    with self._train_lock:
+                        loss = self._train_step()
+                finally:
+                    self._actor_allowed.set()
+
                 if self._step % 100 == 0:
                     logger.info(
                         "step=%d loss=%.4f buffer=%d",
@@ -366,8 +413,11 @@ class TrainPipeline:
                         loss,
                         len(self._buffer),
                     )
-
                 if self._step % self.cfg.sync_interval == 0:
+                    with self._train_lock:
+                        self._inference_net.load_state_dict(
+                            self._unwrap(self._net).state_dict()
+                        )
                     try:
                         weight_queue.put(self._net_state_cpu(), block=False)
                     except queue.Full:
@@ -461,21 +511,28 @@ class TrainPipeline:
         return planes, policies
 
     def _evaluate_and_maybe_promote(self) -> None:
-        evaluator = EloEvaluator(self.cfg, self._device)
-        self._net.eval()
-        result = evaluator.evaluate(self._net, self._baseline)
-        logger.info(
-            "Eval: candidate %d - %d baseline (draws=%d) win_rate=%.1f%% promoted=%s",
-            result.candidate_wins,
-            result.baseline_wins,
-            result.draws,
-            result.win_rate * 100,
-            result.promoted,
-        )
-        if result.promoted:
-            self._unwrap(self._baseline).load_state_dict(self._unwrap(self._net).state_dict())
-            self._save_checkpoint("best.pt")
-            logger.info("Baseline promoted.")
+        self._actor_allowed.clear()
+        try:
+            evaluator = EloEvaluator(self.cfg, self._device)
+            self._net.eval()
+            result = evaluator.evaluate(self._net, self._baseline)
+            logger.info(
+                "Eval: candidate %d - %d baseline (draws=%d) win_rate=%.1f%% promoted=%s",
+                result.candidate_wins,
+                result.baseline_wins,
+                result.draws,
+                result.win_rate * 100,
+                result.promoted,
+            )
+            if result.promoted:
+                self._unwrap(self._baseline).load_state_dict(
+                    self._unwrap(self._net).state_dict()
+                )
+                self._save_checkpoint("best.pt")
+                logger.info("Baseline promoted.")
+        finally:
+            self._actor_allowed.set()
+            self._net.train()
 
     def _unwrap(self, net: DualHeadNet) -> DualHeadNet:
         return net.module if hasattr(net, "module") else net  # DataParallel

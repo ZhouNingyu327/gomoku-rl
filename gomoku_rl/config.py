@@ -74,6 +74,7 @@ class TrainConfig:
     force_thread_actors: bool = False  # required in Colab (no fork/spawn in notebook)
     shared_actor_net: bool = False  # reuse one GPU net across actor threads
     colab_mode: bool = False
+    actor_device: str = ""  # "" = same as device; "cpu" = MCTS on CPU (recommended Colab)
 
     # Google Drive checkpoint mirror (Colab)
     save_to_drive: bool = False
@@ -90,24 +91,29 @@ class TrainConfig:
 
     @classmethod
     def colab_preset(cls, **overrides: object) -> "TrainConfig":
-        """GPU-friendly defaults for Google Colab (T4 / L4)."""
+        """GPU-friendly defaults for Google Colab (T4 / L4).
+
+        Tuned for throughput: moderate MCTS depth + more parallel actors.
+        Each actor keeps its own GPU net (shared_actor_net=False) for true parallelism.
+        """
         base = cls(
             device="cuda",
             num_res_blocks=10,
             num_channels=128,
-            num_simulations=400,
-            mcts_threads=2,
+            num_simulations=120,       # lower sims → faster self-play
+            mcts_threads=1,
             mcts_use_symmetry=False,
-            num_actors=2,
+            num_actors=4,              # more actors → more games in parallel
             batch_size=256,
-            min_buffer_size=2000,
+            min_buffer_size=1000,
             train_steps=50_000,
             save_interval=1000,
             eval_interval=5000,
             eval_games=20,
-            eval_mcts_simulations=200,
+            eval_mcts_simulations=100,
             force_thread_actors=True,
-            shared_actor_net=True,
+            shared_actor_net=False,    # one net per actor thread (parallel)
+            actor_device="cpu",        # self-play on CPU; learner keeps GPU
             colab_mode=True,
             checkpoint_dir=Path("/content/gomoku_rl/checkpoints"),
         )

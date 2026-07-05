@@ -21,6 +21,7 @@ import torch
 from .config import TrainConfig
 from .env import GomokuEnv
 from .network import DualHeadNet
+from .policy_utils import sanitize_policy
 from . import symmetry as sym
 
 
@@ -83,6 +84,7 @@ class MCTS:
 
         # Expand root once to seed priors
         priors, _ = self._evaluate(env, legal)
+        priors = sanitize_policy(priors, legal)
         if add_root_noise:
             priors = self._add_dirichlet_noise(priors, legal)
         self._expand(root, priors, legal)
@@ -100,7 +102,9 @@ class MCTS:
             for f in futures:
                 f.result()
 
-        return self._action_probs(root, legal, temperature), root
+        return sanitize_policy(
+            self._action_probs(root, legal, temperature), legal
+        ), root
 
     def get_action(
         self,
@@ -109,8 +113,10 @@ class MCTS:
         add_root_noise: bool = True,
     ) -> int:
         probs, _ = self.run(env, add_root_noise=add_root_noise, temperature=temperature)
-        if temperature < 1e-3:
+        if temperature <= 1e-3:
             return int(np.argmax(probs))
+        legal = env.legal_moves_mask()
+        probs = sanitize_policy(probs, legal)
         return int(self.rng.choice(len(probs), p=probs))
 
     # ------------------------------------------------------------------ core
@@ -137,6 +143,7 @@ class MCTS:
             return
 
         priors, value = self._evaluate(current_env, legal)
+        priors = sanitize_policy(priors, legal)
         with self._lock:
             if not node.is_expanded:
                 self._expand(node, priors, legal)
@@ -166,6 +173,8 @@ class MCTS:
             if score > best_score:
                 best_score = score
                 best_action = action
+        if best_action < 0:
+            best_action = int(max(node.children, key=lambda a: node.children[a].prior))
         return best_action
 
     def _expand(self, node: MCTSNode, priors: np.ndarray, legal: np.ndarray) -> None:
@@ -227,7 +236,7 @@ class MCTS:
         policy = policy_t.squeeze(0).cpu().numpy()
         if sym_id != 0:
             policy = sym.inverse_transform_policy(policy, sym_id, size)
-        return policy, value_t.item()
+        return sanitize_policy(policy, legal), value_t.item()
 
     # ------------------------------------------------------------------ helpers
     def _add_dirichlet_noise(self, priors: np.ndarray, legal: np.ndarray) -> np.ndarray:
@@ -236,8 +245,7 @@ class MCTS:
         p = priors.copy()
         eps = self.cfg.dirichlet_epsilon
         p[legal_idx] = (1 - eps) * p[legal_idx] + eps * noise
-        p = p / p.sum()
-        return p
+        return sanitize_policy(p, legal)
 
     @staticmethod
     def _action_probs(
@@ -251,12 +259,26 @@ class MCTS:
         visits[~legal] = 0.0
         if visits.sum() == 0:
             visits[legal] = 1.0
-        if temperature < 1e-3:
+            return visits / visits.sum()
+
+        # Low temperature → greedy argmax (avoid visits**(1/t) overflow when t≈1e-3)
+        if temperature <= 1e-3:
             probs = np.zeros_like(visits)
             probs[np.argmax(visits)] = 1.0
             return probs
-        visits = visits ** (1.0 / temperature)
-        return visits / visits.sum()
+
+        # Log-space policy: proportional to N(s,a)^(1/T), numerically stable
+        log_v = np.log(visits + 1e-8) / temperature
+        log_v[~legal] = -np.inf
+        log_v -= np.max(log_v)
+        exp_v = np.exp(log_v)
+        exp_v[~legal] = 0.0
+        total = exp_v.sum()
+        if total <= 0 or not np.isfinite(total):
+            probs = np.zeros_like(visits)
+            probs[np.argmax(visits)] = 1.0
+            return probs
+        return exp_v / total
 
     @staticmethod
     def _terminal_value(env: GomokuEnv, root_player: int) -> float:

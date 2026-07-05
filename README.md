@@ -19,7 +19,7 @@ cd gomoku-rl
 pip install -e .
 
 # Train (GPU)
-python -m gomoku_rl.main --device cuda --num-actors 2 --num-simulations 400
+python -m gomoku_rl.main --device cuda --num-actors 4 --num-simulations 120
 
 # Play against AI
 python play.py --checkpoint checkpoints/best.pt --sims 200
@@ -27,44 +27,37 @@ python play.py --checkpoint checkpoints/best.pt --sims 200
 
 ## Google Colab Training
 
-### Option A — Notebook (recommended)
-
-1. Upload repo to GitHub (see below)
-2. Open [`notebooks/train_gomoku_colab.ipynb`](notebooks/train_gomoku_colab.ipynb) in Colab
-3. Set runtime to **GPU** (T4 / L4)
-4. Run all cells — checkpoints save to Drive automatically
-
-### Option B — Script
-
-```python
-# In a Colab cell after cloning the repo:
-!pip install -e /content/gomoku-rl
-
-from gomoku_rl.colab import train_colab
-train_colab(
-    mount_drive=True,
-    save_to_drive=True,
-    train_steps=50_000,
-    num_simulations=400,
-)
-```
-
-Or from terminal in Colab:
+### 一键训练（推荐）
 
 ```bash
-python colab_train.py --train-steps 50000 --num-simulations 400
+# Colab 中 clone 后运行一个命令即可（含全部稳定性修复）
+!python scripts/colab_setup.py --train-steps 5000
+
+# 续训
+!python scripts/colab_setup.py --train-steps 50000 --resume /content/gomoku_rl/checkpoints/final.pt
 ```
 
-### Colab preset defaults
+或打开 [`notebooks/train_gomoku_colab.ipynb`](notebooks/train_gomoku_colab.ipynb)，**只需运行 1 个代码 cell**。
+
+### 内置修复（无需手动 patch）
+
+| 修复 | 说明 |
+|------|------|
+| `sanitize_policy` | MCTS 策略 NaN 安全 |
+| `temperature <= 1e-3` | 低温贪心，避免 overflow |
+| `inplace=False` | BatchNorm backward 安全 |
+| `actor_device=cpu` | 自对弈 CPU，训练 GPU，无 CUDA 冲突 |
+| `120 sims × 4 actors` | 速度与吞吐平衡 |
+
+### Colab preset 默认值
 
 | Parameter | Value |
 |-----------|-------|
-| GPU | CUDA (auto) |
-| MCTS sims | 400 |
-| Actors | 2 (threaded, shared GPU net) |
+| Learner | GPU (CUDA) |
+| Actors | 4 线程，**CPU** 自对弈 |
+| MCTS sims | 120 |
 | Batch size | 256 |
-| Train steps | 50,000 |
-| Checkpoints | `/content/gomoku_rl/checkpoints/` + Google Drive mirror |
+| Checkpoints | 本地 + Google Drive |
 
 Download `best.pt` from Drive and use locally:
 
@@ -81,11 +74,14 @@ gomoku_rl/
   mcts.py       # MCTS + PUCT
   train.py      # TrainPipeline
   colab.py      # Colab / Drive helpers
+  policy_utils.py  # NaN-safe policy normalization
   gui.py        # Tkinter human vs AI
   config.py     # TrainConfig + colab_preset()
 notebooks/
   train_gomoku_colab.ipynb
-colab_train.py  # Colab CLI entry
+scripts/
+  colab_setup.py   # 一键 Colab 训练（推荐）
+colab_train.py  # Colab CLI 入口
 play.py         # Local GUI launcher
 ```
 
@@ -97,7 +93,7 @@ git init
 git add .
 git commit -m "Initial commit: AlphaZero Gomoku with Colab training"
 git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/gomoku-rl.git
+git remote add origin https://github.com/ZhouNingyu327/gomoku-rl.git
 git push -u origin main
 ```
 

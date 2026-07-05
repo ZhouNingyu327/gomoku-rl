@@ -17,7 +17,8 @@ from .config import TrainConfig
 
 
 def _activation(use_swish: bool) -> nn.Module:
-    return nn.SiLU(inplace=True) if use_swish else nn.ReLU(inplace=True)
+    # inplace=False avoids autograd errors with BatchNorm during backward
+    return nn.SiLU(inplace=False) if use_swish else nn.ReLU(inplace=False)
 
 
 class ResidualBlock(nn.Module):
@@ -112,6 +113,7 @@ class DualHeadNet(nn.Module):
         logits, value = self.forward(planes)
         logits = logits.masked_fill(~legal_mask, -1e9)
         policy = F.softmax(logits, dim=-1)
+        policy = torch.nan_to_num(policy, nan=0.0, posinf=0.0, neginf=0.0)
         return policy, value
 
     def export_torchscript(self, example: torch.Tensor, path: str) -> None:
